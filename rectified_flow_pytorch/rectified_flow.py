@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from copy import deepcopy
 from collections import namedtuple
 from typing import Literal, Callable
@@ -27,6 +28,8 @@ from hyper_connections.hyper_connections_channel_first import get_init_and_expan
 from scipy.optimize import linear_sum_assignment
 
 from rectified_flow_pytorch.nano_flow import NanoFlow
+
+from .guided_diffusion.siamese_model4 import SiameseModel
 
 # helpers
 
@@ -136,6 +139,8 @@ class RectifiedFlow(Module):
     def __init__(
         self,
         model: dict | Module,
+        siamese_model: SiameseModel,
+        siamese_scale: float = 0.01,
         mean_variance_net: bool | None = None,
         time_cond_kwarg: str | None = 'times',
         odeint_kwargs: dict = dict(
@@ -176,7 +181,12 @@ class RectifiedFlow(Module):
 
         self.model = model
         self.time_cond_kwarg = time_cond_kwarg # whether the model is to be conditioned on the times
-
+        
+        self.siamese_model = siamese_model
+        self.siamese_scale = siamese_scale
+        
+        
+        
         # allow for mean variance output prediction
 
         if not exists(mean_variance_net):
@@ -379,6 +389,8 @@ class RectifiedFlow(Module):
         data,
         noise: Tensor | None = None,
         return_loss_breakdown = False,
+        siamese_model: SiameseModel = None,
+        siamese_scale: float = 0.01,
         **model_kwargs
     ):
         batch, *data_shape = data.shape
@@ -386,6 +398,11 @@ class RectifiedFlow(Module):
         data = self.data_normalize_fn(data)
 
         self.data_shape = default(self.data_shape, data_shape)
+        
+        if self.siamese_model is not None:
+            device = data.device  
+            self.siamese_model.siamese_model = self.siamese_model.siamese_model.to(device)
+            self.siamese_model.ocr_model = self.siamese_model.ocr_model.to(device)
 
         # x0 - gaussian noise, x1 - data
 
@@ -458,11 +475,60 @@ class RectifiedFlow(Module):
             target = noise
         else:
             raise ValueError(f'unknown objective {self.predict}')
+        
 
+            
+            
+                
         # losses
+        os.makedirs("logs/hyper_change", exist_ok=True)
+        log_path = os.path.join("logs", "loss_log.txt")
 
+        #main_loss = self.loss_fn(output, target, pred_data = pred_data, times = times, data = data)
+        torch.backends.cudnn.enabled = False
+
+        #Siamese Loss
+        siamese_loss = 0.
+        if self.siamese_model is not None:
+            target_img = ((data + 1) / 2).clamp(0, 1)        # [-1,1] -> [0,1]
+            # pred_data.requires_grad_(False)
+            generated_img = ((pred_data + 1) / 2).clamp(0, 1)
+            
+            siamese_distance = self.siamese_model.siamese_loss(target_img, generated_img)
+           
+            margin = torch.tensor(0.85, device=device)
+            offset = torch.tensor(0.1, device=device)
+            zero = torch.tensor(0.0, device=device)
+                        
+            siamese_loss = torch.max(zero, siamese_distance - margin + offset).mean()
+        
+            '''attention_map, sim_score = self.siamese_model.get_attention_map(target_img, generated_img)
+            
+            
+            if attention_map.shape[2:] != pred_flow.shape[2:]:
+                attention_map = F.interpolate(
+                    attention_map, size=pred_flow.shape[2:], mode="bicubic", align_corners=True
+                )
+        
+            alpha = self.siamese_scale  
+        
+            if sim_score.mean() > 0.70:
+                modulation = -(attention_map - 0.5)
+            else:
+                modulation = +(attention_map - 0.5)
+        
+        
+            target = target * (1 + alpha * modulation)
+            
+            batch_size = target.shape[0]
+            
+            
+            for i in range(batch_size):        
+                save_path = f"attention_maps_clean_hyper/att_map_{i}.png"
+                self.siamese_model.visualize_attention_map(attention_map, save_path=save_path, idx=i, title=f"Attention Map {i}")'''
+                
+                
         main_loss = self.loss_fn(output, target, pred_data = pred_data, times = times, data = data)
-
         consistency_loss = data_match_loss = velocity_match_loss = 0.
 
         if self.use_consistency:
@@ -474,9 +540,21 @@ class RectifiedFlow(Module):
             consistency_loss = data_match_loss + velocity_match_loss * self.consistency_velocity_match_alpha
 
         # total loss
-
-        total_loss = main_loss + consistency_loss * self.consistency_loss_weight
-
+        siamese_hyper = 5
+        print(siamese_hyper)
+        # hyper = 0.000001
+        total_loss = main_loss + consistency_loss * self.consistency_loss_weight + siamese_hyper * siamese_loss
+        log_line = (
+            f"main_loss: {main_loss.item():.6f}, "
+            f"siamese_loss: {siamese_loss:.6f}, "
+            f"total_loss: {total_loss.item():.6f}"
+        )
+        print(log_line)
+        print(f"[siamese] sim_score={siamese_distance.mean():.3f}, "
+                f"alpha={self.siamese_scale:.3f}, ")
+                #f"modulation_range=({modulation.min().item():.3f}, {modulation.max().item():.3f})")
+        with open(log_path, "a") as f:
+            f.write(log_line + "\n")
         if not return_loss_breakdown:
             return total_loss
 
@@ -950,18 +1028,20 @@ class Trainer(Module):
         dataset: dict | Dataset,
         num_train_steps = 70_000,
         learning_rate = 3e-4,
-        batch_size = 16,
-        checkpoints_folder: str = './checkpoints',
+        batch_size = 8,
+        checkpoints_folder: str = './checkpoints_Spotify',
         results_folder: str = './results',
-        save_results_every: int = 100,
-        checkpoint_every: int = 1000,
+        save_results_every: int = 1000,
+        checkpoint_every: int = 10000,
         sample_temperature: float = 1.,
         num_samples: int = 16,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
         use_ema = True,
-        max_grad_norm = 0.5
+        max_grad_norm = 0.5,
+        checkpoint_path: str = './checkpoints_AT&T',
+        result_path: str = './AT&T',
     ):
         super().__init__()
         self.accelerator = Accelerator(**accelerate_kwargs)
@@ -994,8 +1074,10 @@ class Trainer(Module):
         # optimizer, dataloader, and all that
 
         self.optimizer = Adam(rectified_flow.parameters(), lr = learning_rate, **adam_kwargs)
+        
+        
         self.dl = DataLoader(dataset, batch_size = batch_size, shuffle = True, drop_last = True)
-
+        
         self.model, self.optimizer, self.dl = self.accelerator.prepare(self.model, self.optimizer, self.dl)
 
         self.num_train_steps = num_train_steps
@@ -1012,8 +1094,10 @@ class Trainer(Module):
 
         self.checkpoint_every = checkpoint_every
         self.save_results_every = save_results_every
-        self.sample_temperature = sample_temperature
 
+        self.sample_temperature = sample_temperature
+        #self.num_samples = num_samples
+        #self.num_sample_rows = int(math.sqrt(num_samples)) if num_samples > 1 else 1
         self.num_sample_rows = int(math.sqrt(num_samples))
         assert (self.num_sample_rows ** 2) == num_samples, f'{num_samples} must be a square'
         self.num_samples = num_samples
@@ -1071,20 +1155,66 @@ class Trainer(Module):
                 data_shape = data_shape,
                 **additional_sample_kwargs
             )
-      
+        
+        
+        
         sampled = rearrange(sampled, '(row col) c h w -> c (row h) (col w)', row = self.num_sample_rows)
+        
+        
         sampled.clamp_(0., 1.)
 
         save_image(sampled, fname)
         return sampled
+    
 
-    def forward(self):
+
+    def sample_and_save_individual_images(self, checkpoint_path: str, result_path: str = './output', num_samples: int = 16 ):
+        # Load model from checkpoint
+        self.load(checkpoint_path)
+    
+        # Ensure output folder exists
+        os.makedirs(result_path, exist_ok=True)
+    
+        # Use EMA model if available
+        eval_model = default(self.ema_model, self.model)
+    
+        # Get data shape from mock batch
+        dl = cycle(self.dl)
+        mock_data = next(dl)
+        data_shape = mock_data.shape[1:]
+    
+        additional_sample_kwargs = dict()
+        if isinstance(eval_model.model, RectifiedFlow):
+            additional_sample_kwargs.update(temperature = self.sample_temperature)
+    
+        global_idx = 1  
+
+        for repeat in range(63):
+            with torch.no_grad():
+                sampled = eval_model.sample(
+                    batch_size=num_samples,
+                    data_shape=data_shape,
+                    **additional_sample_kwargs
+                )
+    
+            sampled.clamp_(0., 1.)
+    
+            # Save each sample individually
+            for i, img in enumerate(sampled):
+                save_path = os.path.join(result_path, f'sample_{global_idx:04d}.png')
+                save_image(img, save_path)
+                global_idx += 1
+    
+            print(f'[{repeat+1}/63] {len(sampled)} samples saved to {result_path}')
+
+
+    def forward(self, start_step: int = 0):
 
         dl = cycle(self.dl)
 
-        for ind in range(self.num_train_steps):
+        for ind in range(start_step, self.num_train_steps):
             step = ind + 1
-
+            
             self.model.train()
 
             data = next(dl)
@@ -1094,15 +1224,55 @@ class Trainer(Module):
                 self.log(loss_breakdown._asdict(), step = step)
             else:
                 loss = self.model(data)
+            
+            if step == 1:
+                # ¹é¾÷
+                self._siamese_before = {
+                    name: param.detach().clone()
+                    for name, param in self.model.siamese_model.named_parameters()
+                }
+            
 
             self.accelerator.print(f'[{step}] loss: {loss.item():.3f}')
+            
+                    
             self.accelerator.backward(loss)
+            log_grad_path = os.path.join(self.results_folder, "grad_norm.log")
+
+            grad_log = []
+            for name, param in self.model.named_parameters():
+                if 'final_conv' in name and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    log_line = f"[{step}] {name}: grad norm = {grad_norm:.6f}"
+                    print(log_line)
+
+                    with open(log_grad_path, "a") as f:
+                        f.write(log_line + "\n")
+            # if self.is_main:
+            #     print(f"[{step}] Gradient norms:")
+            #     for log in grad_log:
+            #         print(log)
+
+            #     
+            #     with open("grad_norm_log.txt", "a") as f:
+            #         f.write(f"[Step {step}]\n")
+            #         for log in grad_log:
+            #             f.write(log + "\n")
+            #         f.write("\n")
+
 
             self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
             self.optimizer.step()
             self.optimizer.zero_grad()
-
+            
+            if step == 1:
+                print("=== Siamese Model update check ===")
+                for name, param in self.model.siamese_model.named_parameters():
+                    if name in self._siamese_before:
+                        changed = not torch.equal(self._siamese_before[name], param)
+                        print(f"{name} updated? {changed}")
+                    
             if getattr(self.model, 'use_consistency', False):
                 self.model.ema_model.update()
 

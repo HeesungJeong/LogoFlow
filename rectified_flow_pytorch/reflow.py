@@ -9,6 +9,7 @@ from rectified_flow_pytorch.rectified_flow import RectifiedFlow
 
 from ema_pytorch import EMA
 from accelerate import Accelerator
+from typing import Optional
 
 # helpers
 
@@ -24,7 +25,8 @@ class Reflow(Module):
     def __init__(
         self,
         rectified_flow: RectifiedFlow,
-        frozen_model: RectifiedFlow | None = None,
+        #frozen_model: RectifiedFlow | None = None,
+        frozen_model: Optional[RectifiedFlow] = None,
         *,
         batch_size = 16,
 

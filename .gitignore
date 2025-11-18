@@ -6,6 +6,18 @@ __pycache__/
 # C extensions
 *.so
 
+
+#folders
+attention_maps/
+attention_maps_adv_only/
+attention_maps_clean_hyper/
+checkpoints_Spotify/
+gradcam_rectifiedflow/
+results/
+siam_gradcam_map/
+checkpoints/
+
+
 # Distribution / packaging
 .Python
 build/
